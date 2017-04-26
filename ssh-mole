@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# ┏━┓┏━┓╻ ╻   ┏┳┓┏━┓╻  ┏━╸
+# ┗━┓┗━┓┣━┫╺━╸┃┃┃┃ ┃┃  ┣╸
+# ┗━┛┗━┛╹ ╹   ╹ ╹┗━┛┗━╸┗━╸
+
+# MIT License
+#
+# Copyright (c) 2017 Shane R. Spencer
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import os
+import sys
+import socket
+import tempfile
+import select
+
+import logging
+import logging.handlers
+
+RECV_SIZE = 1024
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+syslog_handler = logging.handlers.SysLogHandler(address='/dev/log', facility='user')
+syslog_handler.setFormatter(logging.Formatter('%(name)s: %(levelname)s %(module)s %(message)r'))
+logger.addHandler(syslog_handler)
+
+def create_socket_data(type, socket):
+    """ Create a self referencing dict with common socket parameters """
+    data = {
+        'type': type,
+        'socket': socket,
+        'fileno': socket.fileno()
+    }
+    data[type + '_data'] = data
+
+    return data
+
+# ┏┳┓┏━┓╻┏┓╻
+# ┃┃┃┣━┫┃┃┗┫
+# ╹ ╹╹ ╹╹╹ ╹
+
+def main():
+
+    listen_file_fileno, listen_file_path = tempfile.mkstemp()
+    os.close(listen_file_fileno)
+    os.remove(listen_file_path)
+
+    fork_pid = os.fork()
+
+    if fork_pid == 0:
+
+        os.environ['SSH_ORIG_AUTH_SOCK'] = os.environ['SSH_AUTH_SOCK']
+        os.environ['SSH_AUTH_SOCK'] = listen_file_path
+        os.execvp(sys.argv[1], sys.argv[1:])
+
+    else:
+
+        socket_data_by_fileno = {}
+
+        listen_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listen_socket.bind(listen_file_path)
+        listen_socket.listen(5)
+
+        listen_data = create_socket_data('listen', listen_socket)
+
+        socket_data_by_fileno[listen_socket.fileno()] = listen_data
+
+        while True:
+
+            wait_child_pid, wait_child_status = os.waitpid(fork_pid, os.P_NOWAIT)
+
+            if wait_child_pid == fork_pid:
+                break
+
+            ##fixme
+            import time
+            time.sleep(0.1)
+
+            socket_fileno_read_list, socket_fileno_write_list, socket_fileno_error_list = select.select(
+                socket_data_by_fileno.keys(),
+                [],
+                [],
+                1
+            )
+
+            for socket_fileno in socket_fileno_read_list:
+
+                socket_data = socket_data_by_fileno[socket_fileno]
+
+                listen_data = socket_data.get('listen_data')
+                downstream_data = socket_data.get('downstream_data')
+                upstream_data = socket_data.get('upstream_data')
+
+                logging.info(repr(('selected', socket_data)))
+
+                if socket_data['type'] == 'listen':
+
+                    # ╻  ╻┏━┓╺┳╸┏━╸┏┓╻
+                    # ┃  ┃┗━┓ ┃ ┣╸ ┃┗┫
+                    # ┗━╸╹┗━┛ ╹ ┗━╸╹ ╹
+
+                    downstream_socket, downstream_addr = listen_data['socket'].accept()
+                    downstream_socket.setblocking(0)
+
+                    downstream_data = create_socket_data('downstream', downstream_socket)
+
+                    socket_data_by_fileno[downstream_socket.fileno()] = downstream_data
+
+                elif socket_data['type'] == 'downstream':
+
+                    # ╺┳┓┏━┓╻ ╻┏┓╻┏━┓╺┳╸┏━┓┏━╸┏━┓┏┳┓
+                    #  ┃┃┃ ┃┃╻┃┃┗┫┗━┓ ┃ ┣┳┛┣╸ ┣━┫┃┃┃
+                    # ╺┻┛┗━┛┗┻┛╹ ╹┗━┛ ╹ ╹┗╸┗━╸╹ ╹╹ ╹
+
+                    chunk = downstream_data['socket'].recv(RECV_SIZE)
+
+                    if not upstream_data:
+                        upstream_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        upstream_socket.setblocking(0)
+
+                        upstream_data = create_socket_data('upstream', upstream_socket)
+
+                        upstream_data['downstream_data'] = downstream_data
+                        downstream_data['upstream_data'] = upstream_data
+
+                        socket_data_by_fileno[upstream_socket.fileno()] = upstream_data
+
+                        upstream_data['socket'].connect(os.environ['SSH_AUTH_SOCK'])
+
+                    if not chunk:
+                        downstream_data['socket'].close()
+                        del(socket_data_by_fileno[downstream_data['fileno']])
+
+                        upstream_data['socket'].close()
+                        del(socket_data_by_fileno[upstream_data['fileno']])
+
+                        logging.info(repr(('agent_recv', 'closing!!!!!!')))
+                        logging.info(repr(('agent_recv', socket_data_by_fileno)))
+                    else:
+                        logging.info(repr(('agent_recv', chunk)))
+                        upstream_data['socket'].send(chunk)
+
+                elif socket_data['type'] == 'upstream':
+
+                    # ╻ ╻┏━┓┏━┓╺┳╸┏━┓┏━╸┏━┓┏┳┓
+                    # ┃ ┃┣━┛┗━┓ ┃ ┣┳┛┣╸ ┣━┫┃┃┃
+                    # ┗━┛╹  ┗━┛ ╹ ╹┗╸┗━╸╹ ╹╹ ╹
+
+                    chunk = upstream_data['socket'].recv(RECV_SIZE)
+
+                    if not chunk:
+                        upstream_data['socket'].close()
+                        del(socket_data_by_fileno[upstream_data['fileno']])
+                        logging.info(repr(('upstream_recv', 'closing!!!!!!')))
+                    else:
+                        logging.info(repr(('upstream_recv', chunk)))
+                        downstream_data['socket'].send(chunk)
+
+if __name__ == '__main__':
+    main()
