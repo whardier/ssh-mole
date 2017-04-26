@@ -32,28 +32,59 @@ import sys
 import socket
 import tempfile
 import select
-
-import logging
-import logging.handlers
+import struct
 
 RECV_SIZE = 1024
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-syslog_handler = logging.handlers.SysLogHandler(address='/dev/log', facility='user')
-syslog_handler.setFormatter(logging.Formatter('%(name)s: %(levelname)s %(module)s %(message)r'))
-logger.addHandler(syslog_handler)
+# FROM: http://api.libssh.org/rfc/PROTOCOL.agent
 
-def create_socket_data(type, socket):
-    """ Create a self referencing dict with common socket parameters """
-    data = {
-        'type': type,
-        'socket': socket,
-        'fileno': socket.fileno()
-    }
-    data[type + '_data'] = data
+SSH_AGENTC_REQUEST_RSA_IDENTITIES = 1
+SSH_AGENTC_RSA_CHALLENGE = 3
+SSH_AGENTC_ADD_RSA_IDENTITY = 7
+SSH_AGENTC_REMOVE_RSA_IDENTITY = 8
+SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES = 9
+SSH_AGENTC_ADD_RSA_ID_CONSTRAINED = 24
 
-    return data
+SSH2_AGENTC_REQUEST_IDENTITIES = 11
+SSH2_AGENTC_SIGN_REQUEST = 13
+SSH2_AGENTC_ADD_IDENTITY = 17
+SSH2_AGENTC_REMOVE_IDENTITY = 18
+SSH2_AGENTC_REMOVE_ALL_IDENTITIES = 19
+SSH2_AGENTC_ADD_ID_CONSTRAINED = 25
+
+SSH_AGENTC_ADD_SMARTCARD_KEY = 20
+SSH_AGENTC_REMOVE_SMARTCARD_KEY = 21
+SSH_AGENTC_LOCK = 22
+SSH_AGENTC_UNLOCK = 23
+SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED = 26
+
+SSH_AGENT_FAILURE = 5
+SSH_AGENT_SUCCESS = 6
+
+SSH_AGENT_RSA_IDENTITIES_ANSWER = 2
+SSH_AGENT_RSA_RESPONSE = 4
+
+SSH2_AGENT_IDENTITIES_ANSWER = 12
+SSH2_AGENT_SIGN_RESPONSE = 14
+
+SSH_AGENT_CONSTRAIN_LIFETIME = 1
+SSH_AGENT_CONSTRAIN_CONFIRM = 2
+
+SSH_AGENT_REQUEST_TYPES = [
+    x for x in locals().keys() if x.startswith('SSH_AGENTC') or x.startswith('SSH2_AGENTC')
+]
+
+SSH_MOLEC_SEND_SOURCE_FILE = -1
+
+SSH_MOLEC_GET_FILE = 200
+SSH_MOLEC_PUT_FILE = 201
+
+SSH_MOLE_FAILURE = SSH_AGENT_FAILURE
+SSH_MOLE_SUCCESS = SSH_AGENT_SUCCESS
+
+SSH_MOLE_REQUEST_TYPES = [
+    x for x in locals().keys() if x.startswith('SSH_MOLEC')
+]
 
 # ┏┳┓┏━┓╻┏┓╻
 # ┃┃┃┣━┫┃┃┗┫
@@ -77,7 +108,33 @@ def main():
 
         socket_data_by_fileno = {}
 
+        def close_socket_delete_data(socket_data):
+            if not socket_data:
+                return
+
+            try:
+                socket_data['socket'].close()
+            except:
+                pass
+
+            try:
+                del(socket_data_by_fileno[socket_data['fileno']])
+            except:
+                pass
+
+        def create_socket_data(type, socket):
+            """ Create a self referencing dict with common socket parameters """
+            data = {
+                'type': type,
+                'socket': socket,
+                'fileno': socket.fileno()
+            }
+            data[type + '_data'] = data
+
+            return data
+
         listen_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_socket.bind(listen_file_path)
         listen_socket.listen(5)
 
@@ -109,9 +166,8 @@ def main():
 
                 listen_data = socket_data.get('listen_data')
                 downstream_data = socket_data.get('downstream_data')
+                downstream_protocol_data = socket_data.get('downstream_protocol_data')
                 upstream_data = socket_data.get('upstream_data')
-
-                logging.info(repr(('selected', socket_data)))
 
                 if socket_data['type'] == 'listen':
 
@@ -134,6 +190,7 @@ def main():
 
                     chunk = downstream_data['socket'].recv(RECV_SIZE)
 
+                    #FIXME: MOVE TO PROTOCOL HANDLER
                     if not upstream_data:
                         upstream_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                         upstream_socket.setblocking(0)
@@ -148,17 +205,38 @@ def main():
                         upstream_data['socket'].connect(os.environ['SSH_AUTH_SOCK'])
 
                     if not chunk:
-                        downstream_data['socket'].close()
-                        del(socket_data_by_fileno[downstream_data['fileno']])
-
-                        upstream_data['socket'].close()
-                        del(socket_data_by_fileno[upstream_data['fileno']])
-
-                        logging.info(repr(('agent_recv', 'closing!!!!!!')))
-                        logging.info(repr(('agent_recv', socket_data_by_fileno)))
+                        close_socket_delete_data(downstream_data)
+                        close_socket_delete_data(upstream_data)
                     else:
-                        logging.info(repr(('agent_recv', chunk)))
-                        upstream_data['socket'].send(chunk)
+                        if not downstream_protocol_data:
+
+                            downstream_protocol_data = {
+                                'type': 'SSH_AGENT' #INNOCENT UNTIL PROVEN GUILTY
+                            }
+
+                            socket_data['downstream_protocol_data'] = downstream_protocol_data
+
+                            if len(chunk) < 5:
+                                print 'SENDING SOURCE'
+                                downstream_protocol_data['type'] = 'SSH_MOLE'
+                                downstream_protocol_data['request'] = SSH_MOLEC_SEND_SOURCE_FILE
+                            else:
+                                message_length, request_type = struct.unpack(">ib", chunk[:5])
+
+                                if request_type in SSH_AGENT_REQUEST_TYPES: #REDUNDANT BUT FUN
+                                    downstream_protocol_data['type'] = 'SSH_AGENT'
+
+                                if request_type in SSH_MOLE_REQUEST_TYPES:
+                                    downstream_protocol_data['type'] = 'SSH_MOLE'
+
+                        if downstream_protocol_data['type'] == 'SSH_AGENT': #PASS THROUGH STREAM
+                            upstream_data['socket'].sendall(chunk)
+
+                        if downstream_protocol_data['type'] == 'SSH_MOLE':
+                            if downstream_protocol_data['request'] == SSH_MOLEC_SEND_SOURCE_FILE:
+                                downstream_data['socket'].sendall(open(os.path.basename(__file__)).read())
+                                close_socket_delete_data(downstream_data)
+                            print repr(('SSH_MOLE', chunk))
 
                 elif socket_data['type'] == 'upstream':
 
@@ -169,12 +247,10 @@ def main():
                     chunk = upstream_data['socket'].recv(RECV_SIZE)
 
                     if not chunk:
-                        upstream_data['socket'].close()
-                        del(socket_data_by_fileno[upstream_data['fileno']])
-                        logging.info(repr(('upstream_recv', 'closing!!!!!!')))
+                        close_socket_delete_data(downstream_data)
+                        close_socket_delete_data(upstream_data)
                     else:
-                        logging.info(repr(('upstream_recv', chunk)))
-                        downstream_data['socket'].send(chunk)
+                        downstream_data['socket'].sendall(chunk)
 
 if __name__ == '__main__':
     main()
