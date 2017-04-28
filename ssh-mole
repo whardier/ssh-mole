@@ -27,12 +27,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import print_function, unicode_literals
+
 import os
 import sys
 import socket
 import tempfile
 import select
 import struct
+import argparse
+
+__git_ident__ = '$Id$'
+
+__version__ = '0.01'
 
 RECV_SIZE = 1024
 
@@ -76,8 +83,10 @@ SSH_AGENT_REQUEST_TYPES = [
 
 SSH_MOLEC_SEND_SOURCE_FILE = -1
 
-SSH_MOLEC_GET_FILE = 200
-SSH_MOLEC_PUT_FILE = 201
+SSH_MOLEC_RECEIVE = 200
+SSH_MOLEC_RECEIVE_STREAM = 201
+SSH_MOLEC_SEND = 220
+SSH_MOLEC_SEND_STREAM = 221
 
 SSH_MOLE_FAILURE = SSH_AGENT_FAILURE
 SSH_MOLE_SUCCESS = SSH_AGENT_SUCCESS
@@ -90,7 +99,14 @@ SSH_MOLE_REQUEST_TYPES = [
 # ┃┃┃┣━┫┃┃┗┫
 # ╹ ╹╹ ╹╹╹ ╹
 
-def main():
+def main_old():
+
+    p = argparse.ArgumentParser()
+
+    p.add_argument('command')
+    p.add_argument('remaining', nargs=argparse.REMAINDER)
+
+    args = p.parse_args()
 
     listen_file_fileno, listen_file_path = tempfile.mkstemp()
     os.close(listen_file_fileno)
@@ -102,7 +118,7 @@ def main():
 
         os.environ['SSH_ORIG_AUTH_SOCK'] = os.environ['SSH_AUTH_SOCK']
         os.environ['SSH_AUTH_SOCK'] = listen_file_path
-        os.execvp(sys.argv[1], sys.argv[1:])
+        os.execvp(args.remaining[0], args.remaining)
 
     else:
 
@@ -193,7 +209,6 @@ def main():
                     #FIXME: MOVE TO PROTOCOL HANDLER
                     if not upstream_data:
                         upstream_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                        upstream_socket.setblocking(0)
 
                         upstream_data = create_socket_data('upstream', upstream_socket)
 
@@ -203,6 +218,7 @@ def main():
                         socket_data_by_fileno[upstream_socket.fileno()] = upstream_data
 
                         upstream_data['socket'].connect(os.environ['SSH_AUTH_SOCK'])
+                        upstream_socket.setblocking(0) #This has to come after connect on Cygwin.. so here it is
 
                     if not chunk:
                         close_socket_delete_data(downstream_data)
@@ -252,5 +268,49 @@ def main():
                     else:
                         downstream_data['socket'].sendall(chunk)
 
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+    parser.add_argument('--version', action='version', version='%(prog)s 1.0')
+
+    parser.add_argument("-k", "--key-file", default=None)
+    parser.add_argument("-c", "--cert-file", default=None)
+    parser.add_argument("--log-level", default="DEBUG",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--log-config", default=None)
+
+    server_parser = subparsers.add_parser('server', help='start a serving daemon')
+    server_parser.add_argument("-l", "--listen-addr", required=True)
+    server_parser.add_argument("-m", "--max-connections", default=16)
+
+    server_parser.add_argument("-p", "--plugin", action='append', default=[])
+    server_parser.add_argument("--timeout", type=int, default=300,
+                               help="exit if have no successfull connection in this timeout")
+    server_parser.add_argument("-d", "--daemon", action="store_true", help="became a daemon")
+    server_parser.add_argument("--stdout-file", default=None)
+    server_parser.add_argument("-s", "--show-settings", default=None, nargs='?', const='-',
+                               help="dump settings dict after daemonization, not used in other cases")
+    server_parser.add_argument("--working-dir", default="/tmp",
+                               help="cd to this directory after daemonization, not used in other cases")
+    server_parser.add_argument("--id", default="", help="Used only to find a process")
+    server_parser.set_defaults(subparser_name="server")
+
+    client_parser = subparsers.add_parser('call', help='send cmd to server')
+    client_parser.add_argument("-s", "--server-addr", required=True)
+    client_parser.add_argument("name")
+    client_parser.add_argument("params", nargs="*")
+    client_parser.set_defaults(subparser_name="call")
+
+    keygen_parser = subparsers.add_parser('gen_keys', help='Generate keys')
+    keygen_parser.add_argument("--subj",
+                               default="/C=NN/ST=Some/L=Some/O=Ceph-monitor/OU=Ceph-monitor/CN=mirantis.com")
+    keygen_parser.set_defaults(subparser_name="keygen")
+
+    return parser.parse_args(argv[1:])
+
+def main(argv)
+    options = parse_args(argv)
+
 if __name__ == '__main__':
-    main()
+    exit(main(sys.argv))
