@@ -38,6 +38,7 @@ import struct
 import argparse
 
 __git_ident__ = '$Id$'
+__git_export_subst__ = '$Format:%ci$ ($Format:%h$)'
 
 __version__ = '0.01'
 
