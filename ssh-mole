@@ -310,7 +310,7 @@ def parse_args(argv):
 
     return parser.parse_args(argv[1:])
 
-def main(argv)
+def main(argv):
     options = parse_args(argv)
 
 if __name__ == '__main__':
